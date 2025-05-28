@@ -46,7 +46,7 @@ $env:AWS_SECRET_ACCESS_KEY='YOUR_SECRET_KEY'
 ├── scripts/
 │   └── attack/            # 공격 스크립트
 └── docs/
-    └── analysis/          # 분석 리포트
+    └──서
 ```
 
 ## 필요한 IAM 권한
