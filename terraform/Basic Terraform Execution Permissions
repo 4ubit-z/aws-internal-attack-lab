@@ -1,0 +1,11 @@
+[member1 iam 권한]
+#기본 Terraform 실행 권한
+IAMFullAccess
+AmazonEC2FullAccess
+AmazonS3FullAccess
+CloudWatchFullAccess
+AWSMarketplaceFullAccess
+
+#GuardDuty 및 CloudTrail 관리
+AmazonGuardDutyFullAccess
+AWSCloudTrailFullAccess
