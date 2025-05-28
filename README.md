@@ -42,11 +42,10 @@ $env:AWS_SECRET_ACCESS_KEY='YOUR_SECRET_KEY'
 ## 프로젝트 구조
 
 ```
-├── main.tf                 # Terraform 인프라 코드
-├── scripts/
-│   └── attack/            # 공격 스크립트
-└── docs/
-    └──서
+├── main.tf                # Terraform 인프라 코드
+├── attack/                # 내부 공격
+│   └── scripts/           # 공격 스크립트
+└── docs/                  # 도움 문서
 ```
 
 ## 필요한 IAM 권한
