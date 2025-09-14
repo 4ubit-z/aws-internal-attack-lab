@@ -1,0 +1,10 @@
+[테라폼 명령어]
+terraform init (초기화)
+terraform plan (실행 계획 미리보기)
+terraform apply (실제 AWS에 반영)
+terraform show (현재 상태 확인)
+terraform state list (관리 중인 리소스 목록 보기)
+terraform destroy (모든 리소스 삭제)
+terraform refresh (현재 상태 업데이트)
+terraform fmt (코드 포맷 정리)
+terraform validate (코드 유효성 검사)
